@@ -11,7 +11,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching dedicate
 - **Voice**: handled as transcription text
 - **Media**: receive and send images, videos, and files (inbound media is saved locally)
 - **Typing**: turn on before a reply, off after send
-- **Allowlist**: empty means accept every DM; once set, only listed users are handled
+- **Allowlist**: deny by default. A successful scan adds the scanner's `ilink_user_id`; an empty list does not accept everyone. Use `wechat_approve` for anyone else
 - **Global webhook**: paste once; it covers every current and future bound account
 
 ## One-line install
@@ -50,7 +50,15 @@ Talk in WeChat as usual:
 
 The assistant can show typing while it works. Text, voice transcriptions, images, videos, and files are all handled; outbound media uses a local file path on the Grok Bot machine.
 
-To restrict who can talk, have the assistant add them to the allowlist. To unbind one number, ask to log that WeChat account out; omit the account to log all of them out.
+The scanning user is added to the allowlist automatically. To let someone else talk, have the assistant call `wechat_approve`. An empty list rejects every DM. To unbind one number, ask to log that WeChat account out; omit the account to log all of them out.
+
+## Protocol behavior (aligned with official iLink 2.4.10)
+
+Three behaviors now follow Tencent `@tencent-weixin/openclaw-weixin@2.4.10`. The Grok shell (MCP, webhook, inbox, dedicated assistants) stays:
+
+1. **Login states.** `need_verifycode` asks the user for the digits shown on the phone, then calls `wechat_login_wait` with `verify_code`. `verify_code_blocked` refreshes the QR and stops after repeated failures. `scaned_but_redirect` keeps polling on the server's `redirect_host`. `binded_redirect` means already bound and does **not** write a new `bot_token`. A successful login stores the server `baseurl`.
+2. **Session expiry (ret/errcode -14).** That account pauses for at least 1 hour and is marked `needs_relogin`. Send and typing are refused while it is paused, and the monitor does not keep calling with the expired token after a 60s sleep. Every write of `account.json` uses mode `600`.
+3. **Allowlist.** The scanner's `ilink_user_id` is added to `allowFrom` on login. An empty list rejects everyone.
 
 ## Multiple accounts
 

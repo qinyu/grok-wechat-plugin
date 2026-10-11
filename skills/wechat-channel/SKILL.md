@@ -27,7 +27,7 @@ description: 用户要在 Grok Bot 里安装、登录、收发、登出或卸载
    - **「微信入站唤醒」**（webhook）：入站后 `wechat_inbox` → 按 `ilink_bot_id` 转交专属助手
    - **「微信监听保活」**：每 5 分钟，提示词 `只调用 wechat_start_monitor，确保微信入站监听在跑。除此之外什么都不要做。`
 5. **全局 webhook（粘贴一次）**：Grok Bot 创建 webhook Routine 时**不会**把 url/key 返回给 agent；用户从该 Routine 面板复制 **webhook 地址**和**密钥**发来一次。安装助手调用 `wechat_set_wake`（url、key，省略 `ilink_bot_id`）写入全局 `wake.json`（权限 600），当前及后续所有已绑定账号共用。`wechat_status` 的 `global_wake_configured=true` 表示入站已就绪。
-6. **扫码绑定**：`wechat_login_start` 出码并向用户展示 → 立即 `wechat_login_wait`，重复调用直至 `logged_in=true`；若 `expired=true` 则重新 `wechat_login_start` 后再 `wechat_login_wait`。对方先发一条才有 context_token。
+6. **扫码绑定**：`wechat_login_start` 出码并向用户展示 → 立即 `wechat_login_wait`，重复调用直至 `logged_in=true`；若 `expired=true` 则重新 `wechat_login_start` 后再 `wechat_login_wait`。对方先发一条才有 context_token。若返回 `need_verifycode`，向用户索取手机上的数字，带 `verify_code` 再调 `wechat_login_wait`。`already_bound=true` 时不要把返回当成新登录，也不要写入新 `bot_token`。
 
 每次扫码绑定成功后：
 
@@ -46,7 +46,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 | 工具 | 职责 |
 |---|---|
 | `wechat_login_start` | 出码并展示给用户，下一步立即 `wechat_login_wait` |
-| `wechat_login_wait` | 轮询扫码；`logged_in=true` 时拉起 monitor；`expired=true` 时重新出码 |
+| `wechat_login_wait` | 轮询扫码；`logged_in=true` 时拉起 monitor；`need_verifycode=true` 时带 `verify_code` 再调；`verify_code_blocked` 时展示新码或重新出码；`already_bound=true` 表示已绑定且不写新 token；`expired=true` 时重新出码 |
 | `wechat_set_wake` | 保存全局 webhook（url、key 必填）。可选 `ilink_bot_id` 同时写入该账号 |
 | `wechat_set_dedicated_assistant` | 为已绑定账号登记专属助手 `assistant_id` / `assistant_name` |
 | `wechat_status` | 账号列表、`global_wake_configured`、各号专属助手 / peers、allowlist、inbox、monitor |
@@ -56,7 +56,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 | `wechat_typing` | 发送或取消「正在输入」。必填 `on`、`to_user_id` |
 | `wechat_start_monitor` | 后台长轮询各已绑定账号，入站按账号 POST webhook |
 | `wechat_stop_monitor` | 停止后台长轮询 |
-| `wechat_approve` | `user_id` 加入 allowlist；`clear=true` 清空后接收全部私信。空列表表示接收全部 |
+| `wechat_approve` | `user_id` 加入 allowlist。空列表拒绝所有私信；`clear=true` 清空后同样拒绝，需重新加入。扫码成功会自动加入扫码用户 |
 | `wechat_logout` | 默认登出全部并停 monitor；传入 `ilink_bot_id` 只登出一个 |
 | `wechat_uninstall` | 本机完整清理，返回 `platform_cleanup` 与 `dedicated_assistants_sidebar_delete` |
 
@@ -74,6 +74,8 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 ## 协议
 
 只处理私信（`message_type=USER` 且 `message_state=FINISH`）。回复依赖对方先发过消息留下的 context_token。文字和语音转写都当文本，用 `wechat_send` 回文字。
+
+`ret` / `errcode` 为 `-14` 时，该账号暂停至少 1 小时并标记 `needs_relogin`。暂停期间不要调用 `wechat_send` / `wechat_typing`，应 `wechat_login_start` 重新扫码。allowlist 为空时拒绝所有入站；扫码用户会自动入名单，其他人用 `wechat_approve`。
 
 ## 卸载
 
