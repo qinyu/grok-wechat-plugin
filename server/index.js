@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { accountSendBlocked } from "./protocol-policy.js";
 import {
   appendInbox,
   clearPid,
@@ -87,22 +88,23 @@ const tools = {
     handle: async () => ok(await loginStart()),
   },
   wechat_login_wait: {
-    description: "轮询等待扫码结果。wechat_login_start 出码后立即调用；logged_in=false 且未过期时重复调用；expired=true 时重新 wechat_login_start 后再 wait。",
+    description: "轮询等待扫码结果。need_verifycode=true 时向用户索取数字，带 verify_code 再调。verify_code_blocked=true 时展示返回的新码或重新 wechat_login_start。already_bound=true 表示已绑定，不会写入新 bot_token。scaned_but_redirect 会自动改到 redirect_host 继续轮询。expired=true 时重新出码。",
     inputSchema: {
       type: "object",
       properties: {
         timeout_ms: { type: "number", description: "本次等待毫秒，默认 120000" },
         qrcode: { type: "string", description: "可选，指定等待的二维码 id；默认等待最近一次 wechat_login_start 返回的码" },
+        verify_code: { type: "string", description: "need_verifycode 时，用户在手机微信上看到的数字" },
       },
     },
-    handle: async ({ timeout_ms, qrcode }) => {
-      const r = await loginWait(timeout_ms || 120_000, qrcode);
+    handle: async ({ timeout_ms, qrcode, verify_code }) => {
+      const r = await loginWait(timeout_ms || 120_000, qrcode, verify_code);
       if (r && r.logged_in) ensureMonitor();
       return ok(r);
     },
   },
   wechat_status: {
-    description: "查看所有已绑定账号、allowlist、monitor 是否在跑。",
+    description: "查看所有已绑定账号、allowlist（空名单拒绝全部）、needs_relogin、monitor 是否在跑。",
     inputSchema: { type: "object", properties: {} },
     handle: async () => {
       const payload = statusPayload();
@@ -161,7 +163,7 @@ const tools = {
     handle: async () => ok({ messages: drainInbox(), from_monitor: true }),
   },
   wechat_send: {
-    description: "向微信用户发文本。必须带该用户已缓存的 context_token（对方先发过消息）。Markdown 会转成纯文本。",
+    description: "向微信用户发文本。必须带该用户已缓存的 context_token（对方先发过消息）。Markdown 会转成纯文本。账号 needs_relogin 或会话暂停时拒绝发送。",
     inputSchema: {
       type: "object",
       properties: {
@@ -190,7 +192,7 @@ const tools = {
       ok(await sendMedia(to_user_id, path, kind, caption, ilink_bot_id)),
   },
   wechat_typing: {
-    description: "发送或取消「正在输入」。回复前先打开，发完后关闭。",
+    description: "发送或取消「正在输入」。回复前先打开，发完后关闭。账号 needs_relogin 或会话暂停时拒绝。",
     inputSchema: {
       type: "object",
       properties: {
@@ -246,21 +248,29 @@ const tools = {
     },
   },
   wechat_approve: {
-    description: "把用户加入 allowlist。allowlist 为空表示接受所有私信；非空则只处理列表内用户。",
+    description: "把 user_id 加入 allowlist。空名单拒绝所有私信，不会变成接收全部。扫码成功会自动加入扫码用户的 ilink_user_id。clear=true 清空名单后同样拒绝全部，需重新加入。",
     inputSchema: {
       type: "object",
       properties: {
         user_id: { type: "string" },
-        clear: { type: "boolean", description: "true 时清空 allowlist，恢复接收全部私信" },
+        clear: { type: "boolean", description: "true 时清空 allowlist。清空后拒绝所有私信，直到再次加入用户" },
       },
     },
     handle: async ({ user_id, clear }) => {
       const state = updateState((s) => {
+        s.allowFromPolicy = "deny";
+        if (!Array.isArray(s.allowFrom)) s.allowFrom = [];
         if (clear) s.allowFrom = [];
         else if (user_id && !s.allowFrom.includes(user_id)) s.allowFrom.push(user_id);
         return s;
       });
-      return ok({ allow_from: state.allowFrom });
+      return ok({
+        allow_from: state.allowFrom,
+        allow_from_policy: "deny",
+        hint: state.allowFrom.length
+          ? "只处理 allow_from 中的用户。"
+          : "allowlist 为空，拒绝所有私信。用 wechat_approve 加入 user_id。",
+      });
     },
   },
   wechat_uninstall: {
@@ -414,15 +424,20 @@ async function wakeAgent(messages, log) {
 }
 
 async function pollAccount(account, log) {
+  const block = accountSendBlocked(account);
+  if (block.blocked) {
+    log(`skip bot=${account.ilinkBotId} reason=${block.reason} remaining_ms=${block.remainingMs}`);
+    return { messages: [], skipped: true };
+  }
   const raw = await getUpdates(account);
   if (raw.session_expired) {
-    log(`session expired bot=${account.ilinkBotId}`);
-    return { messages: [], expired: true };
+    log(`session expired bot=${account.ilinkBotId} needs_relogin=true already_paused=${Boolean(raw.already_paused)}`);
+    return { messages: [], skipped: true };
   }
   const collected = await collectInbound(raw.msgs || [], account);
   const state = loadState();
   const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
-  return { messages: allowed, expired: false };
+  return { messages: allowed, skipped: false };
 }
 
 async function runMonitor() {
@@ -431,10 +446,10 @@ async function runMonitor() {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
   log("monitor start");
-  const accounts = listAccounts();
+  const accounts = listAccounts().filter((a) => !accountSendBlocked(a).blocked);
   await Promise.all(accounts.map((a) => notifyStart(a)));
   const onExit = async () => {
-    const current = listAccounts();
+    const current = listAccounts().filter((a) => !accountSendBlocked(a).blocked);
     await Promise.all(current.map((a) => notifyStop(a)));
     clearPid();
     process.exit(0);
@@ -458,13 +473,13 @@ async function runMonitor() {
       const results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
       failures = 0;
       const batch = results.flatMap((r) => r.messages);
-      if (results.some((r) => r.expired)) {
-        await sleep(60_000);
-      }
       if (batch.length) {
         appendInbox(batch);
         log(`inbox +${batch.length}`);
         await wakeAgent(batch, log);
+      } else if (results.length && results.every((r) => r.skipped)) {
+        log("all accounts paused or need relogin; idle 60s without calling getUpdates");
+        await sleep(60_000);
       }
     } catch (err) {
       failures += 1;

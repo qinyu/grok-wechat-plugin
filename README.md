@@ -11,7 +11,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 - **语音**：按转写文本处理
 - **媒体**：收发图片、视频、文件（入站媒体下载到本机）
 - **正在输入**：回复前打开，发完关闭
-- **allowlist**：空则接收全部私信；写入后只处理名单内用户
+- **allowlist**：默认拒绝。扫码成功会把扫码用户的 `ilink_user_id` 写入名单；空名单不再表示接收全部，其他人用 `wechat_approve` 放行
 - **全局 webhook**：粘贴一次，覆盖当前及后续全部已绑定账号
 
 ## 一句话安装
@@ -50,7 +50,15 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 
 回复前可显示「正在输入」。文字、语音转写、图片、视频、文件都可处理；回媒体时用本机文件路径。
 
-要限制谁能对话，让助手把对方加入 allowlist。要解绑某个号，在对话里说登出该微信；不指定则登出全部。
+扫码用户会自动进入 allowlist。其他人要对话时，让助手用 `wechat_approve` 把对方加入名单；空名单会拒绝所有私信。要解绑某个号，在对话里说登出该微信；不指定则登出全部。
+
+## 协议行为（对齐官方 iLink 2.4.10）
+
+相对早期实现，这三处跟腾讯 `@tencent-weixin/openclaw-weixin@2.4.10` 对齐，Grok 的 MCP、webhook、收件箱和专属助手不变：
+
+1. **登录状态**。`need_verifycode` 时向用户要手机上的数字，再带 `verify_code` 调用 `wechat_login_wait`。`verify_code_blocked` 会刷新二维码，多次失败则停止。`scaned_but_redirect` 改到服务器给的 `redirect_host` 继续轮询。`binded_redirect` 表示已经绑定，**不写入新的 `bot_token`**。登录成功时保存服务器返回的 `baseurl`。
+2. **会话过期（ret/errcode -14）**。按账号暂停至少 1 小时，并标记 `needs_relogin`。暂停期间拒绝发送和正在输入，monitor 不再拿过期 token 去拉消息（不再是等 60 秒后继续用）。每次写入 `account.json` 都会把权限设为 `600`。
+3. **allowlist**。扫码用户的 `ilink_user_id` 自动加入 `allowFrom`。空名单拒绝所有人，不再表示接收全部。
 
 ## 多账号
 

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { applySessionExpiry, isSenderAllowed } from "./protocol-policy.js";
 
 const DEFAULT_BASE = "https://ilinkai.weixin.qq.com";
 const MAX_LOCAL_TOKENS = 10;
@@ -34,6 +35,8 @@ export function emptyAccount() {
     typingTickets: {},
     wake: null,
     dedicatedAssistant: null,
+    needsRelogin: false,
+    sessionPausedUntil: 0,
   };
 }
 
@@ -42,6 +45,7 @@ export function emptyState() {
     accounts: [],
     pendingQrs: [],
     allowFrom: [],
+    allowFromPolicy: "deny",
   };
 }
 
@@ -54,6 +58,7 @@ function ensureHome() {
 function migrateLegacyState(raw) {
   if (Array.isArray(raw.accounts)) return raw;
   const state = emptyState();
+  delete state.allowFromPolicy;
   if (raw.token) {
     state.accounts.push({
       ...emptyAccount(),
@@ -73,15 +78,47 @@ function migrateLegacyState(raw) {
   return state;
 }
 
+/**
+ * 旧文件没有 allowFromPolicy。空名单当时表示接收全部；现在改成拒绝，
+ * 并把已保存的扫码用户 ilink_user_id 放进名单。明确写过 deny 的空名单保持为空。
+ */
+export function applyAllowFromPolicy(state, raw = state) {
+  if (!Array.isArray(state.allowFrom)) state.allowFrom = [];
+  if (raw?.allowFromPolicy === "deny") {
+    state.allowFromPolicy = "deny";
+    return state;
+  }
+  if (state.allowFrom.length === 0) {
+    const owners = [];
+    for (const account of state.accounts || []) {
+      const id = typeof account?.ilinkUserId === "string" ? account.ilinkUserId.trim() : "";
+      if (id && !owners.includes(id)) owners.push(id);
+    }
+    state.allowFrom = owners;
+  }
+  state.allowFromPolicy = "deny";
+  return state;
+}
+
 export function loadState() {
   ensureHome();
   const { state } = paths();
   if (!fs.existsSync(state)) return emptyState();
   try {
     const raw = JSON.parse(fs.readFileSync(state, "utf8"));
-    return { ...emptyState(), ...migrateLegacyState(raw) };
+    const migrated = migrateLegacyState(raw);
+    const next = { ...emptyState(), ...migrated };
+    return applyAllowFromPolicy(next, migrated);
   } catch {
     return emptyState();
+  }
+}
+
+function chmod600(file) {
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // 个别文件系统不支持 chmod；仍写出文件
   }
 }
 
@@ -89,8 +126,10 @@ export function saveState(next) {
   ensureHome();
   const { state } = paths();
   const tmp = `${state}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
+  chmod600(tmp);
   fs.renameSync(tmp, state);
+  chmod600(state);
 }
 
 export function updateState(mutator) {
@@ -165,6 +204,7 @@ export function removeAccount(state, { ilink_bot_id, ilink_user_id } = {}) {
 
 export function rememberContext(state, account, userId, contextToken) {
   if (!account || !userId || !contextToken) return state;
+  if (!account.contextTokens) account.contextTokens = {};
   account.contextTokens[userId] = { token: contextToken, at: Date.now() };
   return state;
 }
@@ -192,9 +232,16 @@ export function resolveAccountForPeer(state, { to_user_id, ilink_bot_id } = {}) 
 }
 
 export function isAllowed(state, userId) {
-  if (!userId) return false;
-  if (!state.allowFrom?.length) return true;
-  return state.allowFrom.includes(userId);
+  return isSenderAllowed(state?.allowFrom, userId);
+}
+
+export function markNeedsRelogin(state, ref, now = Date.now()) {
+  const hit = findAccount(state, ref);
+  if (!hit) return null;
+  const next = applySessionExpiry(hit, now);
+  hit.needsRelogin = next.needsRelogin;
+  hit.sessionPausedUntil = next.sessionPausedUntil;
+  return hit;
 }
 
 export function appendInbox(messages) {
@@ -311,9 +358,4 @@ export function hasAccountWake(account) {
 
 export function saveStateSecure(next) {
   saveState(next);
-  try {
-    fs.chmodSync(paths().state, 0o600);
-  } catch {
-    // ignore
-  }
 }
